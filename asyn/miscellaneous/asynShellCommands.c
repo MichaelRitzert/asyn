@@ -36,6 +36,7 @@
 #include "asynOctetSyncIO.h"
 #include "asynShellCommands.h"
 #include <epicsExport.h>
+#include "callback_lut.h"
 
 #define MAX_EOS_LEN 10
 typedef struct asynIOPvt {
@@ -808,6 +809,22 @@ static void asynSetTraceIOTruncateSizeCall(const iocshArgBuf * args) {
     asynSetTraceIOTruncateSize(portName,addr,size);
 }
 
+static const iocshArg asynLutEnableArg0 = {"yesNo", iocshArgInt};
+static const iocshArg *const asynLutEnableArgs[] = {
+    &asynLutEnableArg0};
+static const iocshFuncDef asynLutEnableDef =
+    {"asynLutEnable", 1, asynLutEnableArgs};
+epicsShareFunc int asynLutEnable(int yesNo)
+{
+    enable_LUT(yesNo);
+    printf("Switched LUT for speedup to %s\n",yesNo==0?"off":"on");
+    return 0;
+}
+static void asynLutEnableCall(const iocshArgBuf * args) {
+    int yesNo = args[0].ival;
+    asynLutEnable(yesNo);
+}
+
 static const iocshArg asynEnableArg0 = {"portName", iocshArgString};
 static const iocshArg asynEnableArg1 = {"addr", iocshArgInt};
 static const iocshArg asynEnableArg2 = {"yesNo", iocshArgInt};
@@ -1157,6 +1174,7 @@ static void asynRegister(void)
     iocshRegister(&asynSetTraceInfoMaskDef,asynSetTraceInfoMaskCall);
     iocshRegister(&asynSetTraceFileDef,asynSetTraceFileCall);
     iocshRegister(&asynSetTraceIOTruncateSizeDef,asynSetTraceIOTruncateSizeCall);
+    iocshRegister(&asynLutEnableDef,asynLutEnableCall);
     iocshRegister(&asynEnableDef,asynEnableCall);
     iocshRegister(&asynAutoConnectDef,asynAutoConnectCall);
     iocshRegister(&asynOctetConnectDef,asynOctetConnectCall);

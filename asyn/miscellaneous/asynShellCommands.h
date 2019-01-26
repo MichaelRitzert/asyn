@@ -37,6 +37,8 @@ epicsShareFunc int
  asynAutoConnect(const char *portName,int addr,int yesNo);
 epicsShareFunc int 
  asynEnable(const char *portName,int addr,int yesNo);
+epicsShareFunc int
+ asynLUTEnable(int yesNo);
 
 epicsShareFunc int 
  asynOctetConnect(const char *entry, const char *port, int addr,
