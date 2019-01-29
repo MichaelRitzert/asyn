@@ -32,6 +32,7 @@
 
 #include <epicsExport.h>
 #include "asynDriver.h"
+#include <callback_lut.h>
 
 #define BOOL int
 #ifndef TRUE
@@ -2350,6 +2351,10 @@ static asynStatus interruptStart(void *pasynPvt,ELLLIST **plist)
 
     epicsMutexMustLock(pport->asynManagerLock);
     pinterruptBase->callbackActive = TRUE;
+    if(pinterruptBase->listModified){
+        printf("Cleared Node LUT!\n");
+        clear_LUT(pasynPvt);
+    }
     pinterruptBase->listModified = FALSE;
     epicsMutexUnlock(pport->asynManagerLock);
     *plist = (&pinterruptBase->callbackList);
