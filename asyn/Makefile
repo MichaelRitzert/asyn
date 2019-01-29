@@ -37,7 +37,7 @@ INC += epicsInterruptibleSyscall.h
 INC += callback_lut.h
 asyn_SRCS += asynManager.c
 asyn_SRCS += epicsInterruptibleSyscall.c
-syn_SRCS += callback_lut.cpp
+asyn_SRCS += callback_lut.cpp
 
 SRC_DIRS += $(ASYN)/asynGpib
 INC += asynGpibDriver.h
