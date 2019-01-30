@@ -36,6 +36,7 @@
 #include "asynOctetSyncIO.h"
 #include "asynShellCommands.h"
 #include <epicsExport.h>
+#include "callback_lut.h"
 
 #define MAX_EOS_LEN 10
 typedef struct asynIOPvt {
@@ -687,7 +688,7 @@ static void asynSetTraceIOMaskCall(const iocshArgBuf * args) {
     int mask = args[2].ival;
     asynSetTraceIOMask(portName,addr,mask);
 }
-
+
 static const iocshArg asynSetTraceInfoMaskArg0 = {"portName", iocshArgString};
 static const iocshArg asynSetTraceInfoMaskArg1 = {"addr", iocshArgInt};
 static const iocshArg asynSetTraceInfoMaskArg2 = {"mask", iocshArgInt};
@@ -723,7 +724,7 @@ static void asynSetTraceInfoMaskCall(const iocshArgBuf * args) {
     int mask = args[2].ival;
     asynSetTraceInfoMask(portName,addr,mask);
 }
-
+
 epicsShareFunc int
  asynSetTraceFile(const char *portName,int addr,const char *filename)
 {
@@ -773,7 +774,7 @@ static void asynSetTraceFileCall(const iocshArgBuf * args) {
     const char *filename = args[2].sval;
     asynSetTraceFile(portName,addr,filename);
 }
-
+
 static const iocshArg asynSetTraceIOTruncateSizeArg0 = {"portName", iocshArgString};
 static const iocshArg asynSetTraceIOTruncateSizeArg1 = {"addr", iocshArgInt};
 static const iocshArg asynSetTraceIOTruncateSizeArg2 = {"size", iocshArgInt};
@@ -807,7 +808,23 @@ static void asynSetTraceIOTruncateSizeCall(const iocshArgBuf * args) {
     int size = args[2].ival;
     asynSetTraceIOTruncateSize(portName,addr,size);
 }
-
+
+static const iocshArg asynLutEnableArg0 = {"yesNo", iocshArgInt};
+static const iocshArg *const asynLutEnableArgs[] = {
+    &asynLutEnableArg0};
+static const iocshFuncDef asynLutEnableDef =
+    {"asynLutEnable", 1, asynLutEnableArgs};
+epicsShareFunc int asynLutEnable(int yesNo)
+{
+    enable_LUT(yesNo);
+    printf("Switched LUT for speedup to %s\n",yesNo==0?"off":"on");
+    return 0;
+}
+static void asynLutEnableCall(const iocshArgBuf * args) {
+    int yesNo = args[0].ival;
+    asynLutEnable(yesNo);
+}
+
 static const iocshArg asynEnableArg0 = {"portName", iocshArgString};
 static const iocshArg asynEnableArg1 = {"addr", iocshArgInt};
 static const iocshArg asynEnableArg2 = {"yesNo", iocshArgInt};
@@ -1188,6 +1205,7 @@ static void asynRegister(void)
     iocshRegister(&asynSetTraceInfoMaskDef,asynSetTraceInfoMaskCall);
     iocshRegister(&asynSetTraceFileDef,asynSetTraceFileCall);
     iocshRegister(&asynSetTraceIOTruncateSizeDef,asynSetTraceIOTruncateSizeCall);
+    iocshRegister(&asynLutEnableDef,asynLutEnableCall);
     iocshRegister(&asynEnableDef,asynEnableCall);
     iocshRegister(&asynAutoConnectDef,asynAutoConnectCall);
     iocshRegister(&asynSetQueueLockPortTimeoutDef,asynSetQueueLockPortTimeoutCall);

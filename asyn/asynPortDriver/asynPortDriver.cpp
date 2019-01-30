@@ -36,8 +36,15 @@
 #include "ParamValWrongType.h"
 #include "ParamValNotDefined.h"
 #include "asynPortDriver.h"
+#include "callback_lut.h"
 
 static const char *driverName = "asynPortDriver";
+
+inline std::string uppercase(const char* v){
+    std::string str=std::string(v);
+    for (auto & c: str) c = toupper(c);
+    return str;
+}
 
 /** Class to support parameter library (also called parameter list);
   * set and get values indexed by parameter number (pasynUser->reason)
@@ -86,6 +93,7 @@ private:
     asynPortDriver *pasynPortDriver;
     std::vector<unsigned> flags;
     std::vector<paramVal*> vals;
+    std::unordered_map<std::string,int> indexLUT;
 };
 
 /** Constructor for paramList class.
@@ -100,7 +108,6 @@ paramList::~paramList()
     for (size_t i = 0; i < this->vals.size(); i++)
         delete this->vals[i];
 }
-
 asynStatus paramList::setFlag(int index)
 {
     size_t i;
@@ -112,7 +119,6 @@ asynStatus paramList::setFlag(int index)
     this->flags.push_back((unsigned)index);
     return asynSuccess;
 }
-
 /** Adds a new parameter to the parameter library.
   * \param[in] name The name of this parameter
   * \param[in] type The type of this parameter
@@ -133,6 +139,7 @@ asynStatus paramList::createParam(const char *name, asynParamType type, int *ind
     flags.reserve(vals.size());
     param.release();
     *index = vals.size()-1;
+    if(name)indexLUT[uppercase(name)]=*index;
     return asynSuccess;
 }
 
@@ -142,6 +149,22 @@ asynStatus paramList::createParam(const char *name, asynParamType type, int *ind
   * \return Returns asynParamNotFound if name is not found in the parameter list. */
 asynStatus paramList::findParam(const char *name, int *index)
 {
+    if(name){
+        const std::string u_name=uppercase(name);
+        if(indexLUT.find(u_name)!=indexLUT.end()){
+            *index=indexLUT[u_name];
+            if (*index < 0 || (size_t)*index >= this->vals.size()) {
+                printf("ERROR: LUT found value which should not exist! >>%s<<\n",name);
+            } else if(this->vals[*index]->nameEquals(name)){
+                return asynSuccess;
+            } else {
+                printf("ERROR: LUT found value with unexpected name! Expected >>%s<<, found >>%s<<\n",name,this->vals[*index]->getName());
+            }
+        } else {
+            *index=-1;
+            return asynParamNotFound;
+        }
+    }
     for (size_t i=0; i<this->vals.size(); i++) {
         if (this->vals[i]->nameEquals(name)) {
             *index = i;
@@ -544,11 +567,65 @@ asynStatus paramList::getName(int index, const char **value)
     return asynSuccess;
 }
 
+/** Fill LUT table for different callback types.
+  * Called if the LUT did not contain a certain key
+  * Either the key should have been found, then the LUT was empty and
+  * is built.
+  * If the key is not found, we save it as empty.*/
+template<typename T>
+inline void fill_lut(void*pasynPvt, const int command,const int addr, ELLLIST *pclientList){
+    // the item was not in the lut. Search for it. If it is not found, add a single empty node. Else, the lut seems to be incomplete: Build it!.
+    int address;
+    const interruptNode * pnode=(const interruptNode *)ellFirst(pclientList);
+    bool entry_found=false;
+    while (pnode) {
+        T *pInterrupt = (T *) pnode->drvPvt;
+        pasynManager->getAddr(pInterrupt->pasynUser, &address);
+        if (address == -1) address = 0;
+        if ((command == pInterrupt->pasynUser->reason) &&
+            (address == addr)) {
+            entry_found=true;
+            break;
+        }
+        pnode = (const interruptNode *)ellNext(&pnode->node);
+    }
+    if(entry_found){  //build LUT
+        pnode=(const interruptNode *)ellFirst(pclientList);
+        while (pnode) {
+            T *pInterrupt = (T *) pnode->drvPvt;
+            pasynManager->getAddr(pInterrupt->pasynUser, &address);
+            if (address == -1) address = 0;
+            nodeLUT.addNode(pasynPvt, pInterrupt->pasynUser->reason,address,pnode);
+            pnode = (const interruptNode *)ellNext(&pnode->node);
+        }
+    } else {  //add single empty node
+        nodeLUT.addEmptyNode(pasynPvt,command,addr);
+    }
+}
+
+
+/** Template for different types of callbacks
+  * to reduce code duplication.*/
+template <typename T, typename ...Ts >
+inline void write_callback(T* pInterrupt,const asynStatus& status, const int & alarmStatus,
+                           const int & alarmSeverity, const epicsTimeStamp& timeStamp,Ts&&... args ){
+    /* Set the status for the callback */
+    pInterrupt->pasynUser->auxStatus = status;
+    pInterrupt->pasynUser->alarmStatus = alarmStatus;
+    pInterrupt->pasynUser->alarmSeverity = alarmSeverity;
+    /* Set the timestamp for the callback */
+    pInterrupt->pasynUser->timestamp = timeStamp;
+    pInterrupt->callback(pInterrupt->userPvt,
+                         pInterrupt->pasynUser,
+                         args...);
+}
+
 /** Calls the registered asyn callback functions for all clients for an integer parameter */
 asynStatus paramList::int32Callback(int command, int addr)
 {
+    typedef asynInt32Interrupt interruptType;
     ELLLIST *pclientList;
-    interruptNode *pnode;
+    const interruptNode *pnode=nullptr;
     asynStandardInterfaces *pInterfaces = this->pasynPortDriver->getAsynStdInterfaces();
     epicsTimeStamp timeStamp;
     this->pasynPortDriver->getTimeStamp(&timeStamp);
@@ -562,37 +639,54 @@ asynStatus paramList::int32Callback(int command, int addr)
     status = getInteger(command, &value);
     getAlarmStatus(command, &alarmStatus);
     getAlarmSeverity(command, &alarmSeverity);
-    if (!pInterfaces->int32InterruptPvt) return(asynParamNotFound);
-    pasynManager->interruptStart(pInterfaces->int32InterruptPvt, &pclientList);
-    pnode = (interruptNode *)ellFirst(pclientList);
-    while (pnode) {
-        asynInt32Interrupt *pInterrupt = (asynInt32Interrupt *) pnode->drvPvt;
-        pasynManager->getAddr(pInterrupt->pasynUser, &address);
-        /* If this is not a multi-device then address is -1, change to 0 */
-        if (address == -1) address = 0;
-        if ((command == pInterrupt->pasynUser->reason) &&
-            (address == addr)) {
-            /* Set the status for the callback */
-            pInterrupt->pasynUser->auxStatus = status;
-            pInterrupt->pasynUser->alarmStatus = alarmStatus;
-            pInterrupt->pasynUser->alarmSeverity = alarmSeverity;
-            /* Set the timestamp for the callback */
-            pInterrupt->pasynUser->timestamp = timeStamp;
-            pInterrupt->callback(pInterrupt->userPvt,
-                                 pInterrupt->pasynUser,
-                                 value);
+
+    void * pasynPvt=pInterfaces->int32InterruptPvt;
+    if (!pasynPvt) return(asynParamNotFound);
+    //interrupt start MUST be called before accessing any nodes.
+    pasynManager->interruptStart(pasynPvt, &pclientList);
+    if(nodeLUT.is_enabled()){
+       std::pair<std::vector<const interruptNode*>,bool> lut_entry=
+               nodeLUT.getNodes(pasynPvt,command,addr);
+       if(!lut_entry.second){
+           fill_lut<interruptType>(pasynPvt,command,addr,pclientList);
+           lut_entry=nodeLUT.getNodes(pasynPvt,command,addr);
+       }
+       if(lut_entry.second){
+           for(const auto & node:lut_entry.first){
+               interruptType *pInterrupt = (interruptType *) node->drvPvt;
+               pasynManager->getAddr(pInterrupt->pasynUser, &address);
+               write_callback<interruptType>(pInterrupt,status,alarmStatus,
+                                             alarmSeverity,timeStamp,value);
+           }
+       } else {
+           printf("ERROR! No lut_entry found after adding step! %d %d\n", command,addr);
+       }
+
+    } else {   // old code which does not use LUT.
+        pnode=(const interruptNode *)ellFirst(pclientList);
+        while (pnode) {
+            interruptType *pInterrupt = (interruptType *) pnode->drvPvt;
+            pasynManager->getAddr(pInterrupt->pasynUser, &address);
+            /* If this is not a multi-device then address is -1, change to 0 */
+            if (address == -1) address = 0;
+            if ((command == pInterrupt->pasynUser->reason) &&
+                (address == addr)) {
+                write_callback<interruptType>(pInterrupt,status,alarmStatus,
+                                              alarmSeverity,timeStamp,value);
+            }
+            pnode = (const interruptNode *)ellNext(&pnode->node);
         }
-        pnode = (interruptNode *)ellNext(&pnode->node);
     }
-    pasynManager->interruptEnd(pInterfaces->int32InterruptPvt);
-    return(asynSuccess);
+    pasynManager->interruptEnd(pasynPvt);
+    return asynSuccess;
 }
 
 /** Calls the registered asyn callback functions for all clients for an UInt32 parameter */
 asynStatus paramList::uint32Callback(int command, int addr, epicsUInt32 interruptMask)
 {
+    typedef asynUInt32DigitalInterrupt interruptType;
     ELLLIST *pclientList;
-    interruptNode *pnode;
+    const interruptNode *pnode=nullptr;
     asynStandardInterfaces *pInterfaces = this->pasynPortDriver->getAsynStdInterfaces();
     epicsTimeStamp timeStamp;
     this->pasynPortDriver->getTimeStamp(&timeStamp);
@@ -606,38 +700,58 @@ asynStatus paramList::uint32Callback(int command, int addr, epicsUInt32 interrup
     status = getUInt32(command, &value, 0xFFFFFFFF);
     getAlarmStatus(command, &alarmStatus);
     getAlarmSeverity(command, &alarmSeverity);
-    if (!pInterfaces->uInt32DigitalInterruptPvt) return(asynParamNotFound);
-    pasynManager->interruptStart(pInterfaces->uInt32DigitalInterruptPvt, &pclientList);
-    pnode = (interruptNode *)ellFirst(pclientList);
-    while (pnode) {
-        asynUInt32DigitalInterrupt *pInterrupt = (asynUInt32DigitalInterrupt *) pnode->drvPvt;
-        pasynManager->getAddr(pInterrupt->pasynUser, &address);
-        /* If this is not a multi-device then address is -1, change to 0 */
-        if (address == -1) address = 0;
-        if ((command == pInterrupt->pasynUser->reason) &&
-            (address == addr) &&
-            (pInterrupt->mask & interruptMask)) {
-            /* Set the status for the callback */
-            pInterrupt->pasynUser->auxStatus = status;
-            pInterrupt->pasynUser->alarmStatus = alarmStatus;
-            pInterrupt->pasynUser->alarmSeverity = alarmSeverity;
-            /* Set the timestamp for the callback */
-            pInterrupt->pasynUser->timestamp = timeStamp;
-            pInterrupt->callback(pInterrupt->userPvt,
-                                 pInterrupt->pasynUser,
-                                 pInterrupt->mask & value);
+    void * pasynPvt=pInterfaces->uInt32DigitalInterruptPvt;
+    if (!pasynPvt) return(asynParamNotFound);
+    //interrupt start MUST be called before accessing any nodes.
+    pasynManager->interruptStart(pasynPvt, &pclientList);
+    if(nodeLUT.is_enabled()){
+       std::pair<std::vector<const interruptNode*>,bool> lut_entry=
+               nodeLUT.getNodes(pasynPvt,command,addr);
+       if(!lut_entry.second){
+           fill_lut<interruptType>(pasynPvt,command,addr,pclientList);
+           lut_entry=nodeLUT.getNodes(pasynPvt,command,addr);
+       }
+       if(lut_entry.second){
+           for(const auto & node:lut_entry.first){
+               interruptType *pInterrupt = (interruptType *) node->drvPvt;
+               pasynManager->getAddr(pInterrupt->pasynUser, &address);
+               if(pInterrupt->mask & interruptMask){
+                   write_callback<interruptType>(pInterrupt,status,alarmStatus,
+                                                 alarmSeverity,timeStamp,pInterrupt->mask &value);
+               }
+           }
+       } else {
+           printf("ERROR! No lut_entry found after adding step! %d %d\n", command,addr);
+           std::terminate();
+       }
+
+    } else {   // old code which does not use LUT.
+        pnode=(const interruptNode *)ellFirst(pclientList);
+        while (pnode) {
+            interruptType *pInterrupt = (interruptType *) pnode->drvPvt;
+            pasynManager->getAddr(pInterrupt->pasynUser, &address);
+            /* If this is not a multi-device then address is -1, change to 0 */
+            if (address == -1) address = 0;
+            if ((command == pInterrupt->pasynUser->reason) &&
+                (address == addr)&&
+                (pInterrupt->mask & interruptMask)) {
+                write_callback<interruptType>(pInterrupt,status,alarmStatus,
+                                              alarmSeverity,timeStamp,pInterrupt->mask &value);
+            }
+            pnode = (const interruptNode *)ellNext(&pnode->node);
         }
-        pnode = (interruptNode *)ellNext(&pnode->node);
     }
-    pasynManager->interruptEnd(pInterfaces->uInt32DigitalInterruptPvt);
+
+    pasynManager->interruptEnd(pasynPvt);
     return(asynSuccess);
 }
 
 /** Calls the registered asyn callback functions for all clients for a double parameter */
 asynStatus paramList::float64Callback(int command, int addr)
 {
+    typedef asynFloat64Interrupt interruptType;
     ELLLIST *pclientList;
-    interruptNode *pnode;
+    const interruptNode *pnode=nullptr;
     asynStandardInterfaces *pInterfaces = this->pasynPortDriver->getAsynStdInterfaces();
     epicsTimeStamp timeStamp;
     this->pasynPortDriver->getTimeStamp(&timeStamp);
@@ -651,37 +765,54 @@ asynStatus paramList::float64Callback(int command, int addr)
     status = getDouble(command, &value);
     getAlarmStatus(command, &alarmStatus);
     getAlarmSeverity(command, &alarmSeverity);
-    if (!pInterfaces->float64InterruptPvt) return(asynParamNotFound);
-    pasynManager->interruptStart(pInterfaces->float64InterruptPvt, &pclientList);
-    pnode = (interruptNode *)ellFirst(pclientList);
-    while (pnode) {
-        asynFloat64Interrupt *pInterrupt = (asynFloat64Interrupt *) pnode->drvPvt;
-        pasynManager->getAddr(pInterrupt->pasynUser, &address);
-        /* If this is not a multi-device then address is -1, change to 0 */
-        if (address == -1) address = 0;
-        if ((command == pInterrupt->pasynUser->reason) &&
-            (address == addr)) {
-            /* Set the status for the callback */
-            pInterrupt->pasynUser->auxStatus = status;
-            pInterrupt->pasynUser->alarmStatus = alarmStatus;
-            pInterrupt->pasynUser->alarmSeverity = alarmSeverity;
-            /* Set the timestamp for the callback */
-            pInterrupt->pasynUser->timestamp = timeStamp;
-            pInterrupt->callback(pInterrupt->userPvt,
-                                 pInterrupt->pasynUser,
-                                 value);
+    void * pasynPvt=pInterfaces->float64InterruptPvt;
+    if (!pasynPvt) return(asynParamNotFound);
+    //interrupt start MUST be called before accessing any nodes.
+    pasynManager->interruptStart(pasynPvt, &pclientList);
+    if(nodeLUT.is_enabled()){
+       std::pair<std::vector<const interruptNode*>,bool> lut_entry=
+               nodeLUT.getNodes(pasynPvt,command,addr);
+       if(!lut_entry.second){
+           fill_lut<interruptType>(pasynPvt,command,addr,pclientList);
+           lut_entry=nodeLUT.getNodes(pasynPvt,command,addr);
+       }
+       if(lut_entry.second){
+           for(const auto & node: lut_entry.first){
+               interruptType *pInterrupt = (interruptType *) node->drvPvt;
+               pasynManager->getAddr(pInterrupt->pasynUser, &address);
+               write_callback<interruptType>(pInterrupt,status,alarmStatus,
+                                             alarmSeverity,timeStamp,value);
+           }
+       } else {
+           printf("ERROR! No lut_entry found after adding step! %d %d\n", command,addr);
+           std::terminate();
+       }
+
+    } else {   // old code which does not use LUT.
+        pnode=(const interruptNode *)ellFirst(pclientList);
+        while (pnode) {
+            interruptType *pInterrupt = (interruptType *) pnode->drvPvt;
+            pasynManager->getAddr(pInterrupt->pasynUser, &address);
+            /* If this is not a multi-device then address is -1, change to 0 */
+            if (address == -1) address = 0;
+            if ((command == pInterrupt->pasynUser->reason) &&
+                (address == addr)) {
+                write_callback<interruptType>(pInterrupt,status,alarmStatus,
+                                              alarmSeverity,timeStamp,value);
+            }
+            pnode = (const interruptNode *)ellNext(&pnode->node);
         }
-        pnode = (interruptNode *)ellNext(&pnode->node);
     }
-    pasynManager->interruptEnd(pInterfaces->float64InterruptPvt);
+    pasynManager->interruptEnd(pasynPvt);
     return(asynSuccess);
 }
 
 /** Calls the registered asyn callback functions for all clients for a string parameter */
 asynStatus paramList::octetCallback(int command, int addr)
 {
+    typedef asynOctetInterrupt interruptType;
     ELLLIST *pclientList;
-    interruptNode *pnode;
+    const interruptNode *pnode=nullptr;
     asynStandardInterfaces *pInterfaces = this->pasynPortDriver->getAsynStdInterfaces();
     epicsTimeStamp timeStamp;
     this->pasynPortDriver->getTimeStamp(&timeStamp);
@@ -696,29 +827,44 @@ asynStatus paramList::octetCallback(int command, int addr)
     getStatus(command, &status);
     getAlarmStatus(command, &alarmStatus);
     getAlarmSeverity(command, &alarmSeverity);
-    if (!pInterfaces->octetInterruptPvt) return(asynParamNotFound);
-    pasynManager->interruptStart(pInterfaces->octetInterruptPvt, &pclientList);
-    pnode = (interruptNode *)ellFirst(pclientList);
-    while (pnode) {
-        asynOctetInterrupt *pInterrupt = (asynOctetInterrupt *) pnode->drvPvt;
-        pasynManager->getAddr(pInterrupt->pasynUser, &address);
-        /* If this is not a multi-device then address is -1, change to 0 */
-        if (address == -1) address = 0;
-        if ((command == pInterrupt->pasynUser->reason) &&
-            (address == addr)) {
-            /* Set the status for the callback */
-            pInterrupt->pasynUser->auxStatus = status;
-            pInterrupt->pasynUser->alarmStatus = alarmStatus;
-            pInterrupt->pasynUser->alarmSeverity = alarmSeverity;
-            /* Set the timestamp for the callback */
-            pInterrupt->pasynUser->timestamp = timeStamp;
-            pInterrupt->callback(pInterrupt->userPvt,
-                                 pInterrupt->pasynUser,
-                                 value, strlen(value)+1, ASYN_EOM_END);
+    void * pasynPvt=pInterfaces->octetInterruptPvt;
+    if (!pasynPvt) return(asynParamNotFound);
+    //interrupt start MUST be called before accessing any nodes.
+    pasynManager->interruptStart(pasynPvt, &pclientList);
+    if(nodeLUT.is_enabled()){
+       std::pair<std::vector<const interruptNode*> ,bool> lut_entry=
+               nodeLUT.getNodes(pasynPvt,command,addr);
+       if(!lut_entry.second){
+           fill_lut<interruptType>(pasynPvt,command,addr,pclientList);
+           lut_entry=nodeLUT.getNodes(pasynPvt,command,addr);
+       }
+       if(lut_entry.second){
+           for(const auto & node:lut_entry.first){
+               interruptType *pInterrupt = (interruptType *) node->drvPvt;
+               pasynManager->getAddr(pInterrupt->pasynUser, &address);
+               write_callback<interruptType>(pInterrupt,status,alarmStatus,
+                                             alarmSeverity,timeStamp,value, strlen(value)+1, ASYN_EOM_END);
+           }
+       } else {
+           printf("ERROR! No lut_entry found after adding step! %d %d\n", command,addr);
+           std::terminate();
+       }
+    } else {   // old code which does not use LUT.
+        pnode=(const interruptNode *)ellFirst(pclientList);
+        while (pnode) {
+            interruptType *pInterrupt = (interruptType *) pnode->drvPvt;
+            pasynManager->getAddr(pInterrupt->pasynUser, &address);
+            /* If this is not a multi-device then address is -1, change to 0 */
+            if (address == -1) address = 0;
+            if ((command == pInterrupt->pasynUser->reason) &&
+                (address == addr)) {
+                write_callback<interruptType>(pInterrupt,status,alarmStatus,
+                                              alarmSeverity,timeStamp,value, strlen(value)+1, ASYN_EOM_END);
+            }
+            pnode = (const interruptNode *)ellNext(&pnode->node);
         }
-        pnode = (interruptNode *)ellNext(&pnode->node);
     }
-    pasynManager->interruptEnd(pInterfaces->octetInterruptPvt);
+    pasynManager->interruptEnd(pasynPvt);
     return(asynSuccess);
 }
 
@@ -798,7 +944,6 @@ paramVal* paramList::getParameter(int index)
     if (index < 0 || (size_t)index >= this->vals.size()) throw ParamListInvalidIndex("paramList::getParameter invalid index");
     return this->vals[index];
 }
-
 
 /* I thought this would be a temporary fix until EPICS supported PINI after interruptAccept, which would then be used
  * for input records that need callbacks after output records that also have PINI and that could affect them. But this
